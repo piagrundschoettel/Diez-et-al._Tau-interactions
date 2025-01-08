@@ -1,0 +1,937 @@
+---
+title: "TEanalysis DESeq2 pipeline"
+author: "Pia Grundschoettel"
+date: "2025-01-06"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Packages
+
+
+```{r}
+library(apeglm)
+library(tidyr)
+library(biomaRt)
+library(ComplexHeatmap)
+library(DESeq2)
+library(IHW)
+library(limma)
+library(pheatmap)
+library(dplyr)
+library(tidyverse)
+library(edgeR)
+library(ggplot2)
+library(ggh4x)
+library(openxlsx)
+library(tximport)
+library(reshape2)
+library(cowplot)
+library(ggrepel)
+library(MatrixGenerics)
+library(ggpubr)
+library(ggExtra)
+library(UpSetR)
+library(clusterProfiler)
+library(viridis)
+```
+
+
+# Functions
+
+```{r}
+source(file = "/data/analysis/pia/functions_250106.R")
+```
+
+
+
+
+
+# 1. Import sample table
+```{r sample table import}
+# Import your sample table
+sample_table <- read.xlsx("/data/analysis/pia/sample_table.xlsx")
+
+sample_table$cond_set <- paste(sample_table$condition, sample_table$set, sep="_")
+
+
+# Ensure you generate a variable "ID" which matches the sequencing ID in the alignment output
+rownames(sample_table) <- sample_table$ID
+
+
+# double-check your sample_table includes all necessary information
+c("ID", "condition") %in% colnames(sample_table) 
+
+
+## Add columns with factors for comparisons in model
+sample_table$condition <- factor(sample_table$condition,
+                                 levels = c(  "Base", "OE", "KD"))#,
+
+sample_table$set <- factor(sample_table$set,
+                                     levels = c("1", "2"))
+
+sample_table$cond_set <- factor(sample_table$cond_set,
+                                levels= c("Base_1", "Base_2", "OE_1", "OE_2", "KD_1", "KD_2"))
+
+sample_table$uniquely_mapped_percent <- as.numeric(sample_table$uniquely_mapped_percent)
+
+
+# define factor for order of samples in plotting 
+plot_order <- c("condition")
+
+```
+
+Colour scheme customization
+
+```{r}
+
+
+col_condition <- c("#818183", "#3FB7B9", "#FFAF00")
+names(col_condition) <- c("Base", "OE", "KD")
+
+col_set <- c("#0C7C59", "#D64933")
+names(col_set) <- c("1", "2")
+
+col_cond_set <- c("#FF8811", "#F4D06F","#399388", "#9DD9D2", "#392F5A", "#705FAB")
+names(col_cond_set) <- c("Base_1", "Base_2", "OE_1", "OE_2", "KD_1", "KD_2")
+
+# combine color code into list
+ann_colors <- list(condition = col_condition, 
+                   cond_set = col_cond_set, 
+                   set=col_set)
+```
+
+# 2 Import the count data
+
+```{r}
+counts <- lapply(list.files(path="/data/analysis/pia/TE_analysis/output_test", pattern = "*.cntTable", full.names = TRUE), # lists every .cntTable file in counts dir 
+                 read.table, header = TRUE)%>% # reads every .cntTable as a dataframe
+  reduce(left_join, by = "gene.TE")
+colnames(counts) <- str_split_fixed(pattern="\\.",colnames(counts), n=5)[,4]
+colnames(counts)[1] <- "gene.TE"
+
+#To create one count table for all samples, if youare starting with the count table you can load it up instead
+# write_csv(counts, "/output/count_table.csv")
+
+counts <- counts[,c("gene.TE", sample_table$ID)]
+
+#remove suffixes on ENSEMBL IDs
+counts$Symbol <- gsub(counts$gene.TE, pattern="\\.[0-9]+$", replacement="")
+
+colnames(counts)[colnames(counts) == "Symbol"] <- "ensembl_gene_id"
+
+```
+
+
+```{r}
+
+##biomaRt Annotations ( to add more attributes use listAttributes(mart) )
+mart <- useDataset("mmusculus_gene_ensembl", useMart("ensembl"))
+
+df_attr <- listAttributes(mart) # - to add more attributes
+ID_QueryAttributes = c("ensembl_gene_id", "external_gene_name", "gene_biotype", "chromosome_name", "start_position", "end_position", "transcript_start")
+ID_QueryFilters = "ensembl_gene_id"
+tmp1 <- data.frame("ensembl_gene_id" = counts$ensembl_gene_id)
+```
+
+```{r}
+
+#biomaRt get gene names
+ids <- getBM(attributes = ID_QueryAttributes,
+             filters = ID_QueryFilters,
+             values = tmp1[, "ensembl_gene_id"], 
+             mart = mart)
+
+#Merge Gene Annotations and Rename symbol column containing ensembl ids to 'ensembl_gene_id'
+
+counts = left_join(x = counts, y = ids, by="ensembl_gene_id")
+```
+
+```{r}
+table(is.na(counts$gene_biotype))
+#Repeats aren't annotated in biomaRT so move them over to external_gene_name column
+counts$external_gene_name[is.na(counts$external_gene_name)] <- as.character(counts$ensembl_gene_id[is.na(counts$external_gene_name)])
+#Separate Rep familly
+counts$rep_familly[is.na(counts$gene_biotype)] <- sub(".*:([-A-Za-z0-9]+):.*", "\\1", counts$ensembl_gene_id[is.na(counts$gene_biotype)], perl=TRUE)
+#Separate Rep Name 
+counts$rep_name[is.na(counts$gene_biotype)] <- sub("([A-Za-z0-9]+):.*", "\\1", counts$ensembl_gene_id[is.na(counts$gene_biotype)], perl=TRUE)
+#Separate Rep Class
+counts$rep_class[is.na(counts$gene_biotype)] <- gsub(".*:([A-Za-z0-9]+)", "\\1", counts$ensembl_gene_id[is.na(counts$gene_biotype)])
+#Add Repeat Class to gene_biotype
+counts$gene_biotype[is.na(counts$gene_biotype)] <- gsub(".*:", "", counts$ensembl_gene_id[is.na(counts$gene_biotype)])
+#Add Rep Name to external gene name
+counts$external_gene_name[!is.na(counts$rep_name)] <- as.character(counts$rep_name[!is.na(counts$rep_name)])
+```
+
+```{r}
+#move gene annotation columns to beginning
+counts <- counts %>% select(ensembl_gene_id, 
+                            chromosome_name,
+                            start_position,
+                            end_position,
+                            external_gene_name, 
+                            gene_biotype, 
+                            rep_class, 
+                            rep_familly, 
+                            rep_name, 
+                            everything()
+                            )
+colnames(counts)
+```
+
+```{r}
+colnames(counts)
+#Put Count table in DGElist
+dge <- DGEList(counts=counts[,11:26], genes = counts[,1:10], group = sample_table$condition)
+
+#if Some ENSEMBL ids are gene duplicates, keep the ones with the highest counts
+o <- order(rowSums(dge$counts), decreasing=TRUE)
+counts_try <- dge[o,]
+table(duplicated(dge$genes$external_gene_name))
+dups <- duplicated(dge$genes$external_gene_name)
+dge <- dge[!dups,]
+
+#Change rownames to gene name
+rownames(dge$counts) <- dge$genes$external_gene_name
+
+star.counts <- dge$counts
+genes <- dge$genes
+
+```
+
+# 3. Creating DESeq2 object
+```{r}
+identical(colnames(star.counts), rownames(sample_table))
+
+dds_txi <- DESeqDataSetFromMatrix(countData = star.counts,
+                                  colData = sample_table,
+                                  design = ~ set + condition )
+
+```
+
+```{r}
+genes_to_keep <- rowSums(counts(dds_txi) >= 10) >= min(table(sample_table$condition))  #number of donors and number of different input amounts
+
+table(genes_to_keep)
+
+dds <- dds_txi[genes_to_keep,]
+```
+
+```{r DESeq calculation}
+dds <- DESeq(dds)
+```
+
+```{r gene annotation}
+norm_anno <- as.data.frame(counts(dds, normalized=T))
+norm_anno$GENEID <- row.names(norm_anno)
+  
+  # add gene annotation
+genes <- genes[genes$external_gene_name %in% row.names(norm_anno),]
+
+norm_anno <- merge(x=norm_anno, y=genes,by.x= "GENEID", by.y="external_gene_name" )
+
+```
+
+```{r varStab}
+
+if (nrow(colData(dds)) < 30) {
+  dds_vst <- rlog(dds, blind = TRUE)
+} else dds_vst <- vst(dds, blind = TRUE)
+
+# choose columns from the sample table for the heatmap annotation
+plot_annotation <- sample_table[ , c("condition", "set"), 
+                                 drop = F]
+rownames(plot_annotation) <- sample_table$ID
+
+```
+
+
+# 4 Correcting batch effect
+```{r eval=FALSE, fig.height=12, fig.width=8}
+plotHeatmap(input = norm_anno,
+            geneset = "all",
+            title = "Heatmap of all present genes",
+            show_rownames = FALSE,
+            cluster_cols = TRUE)
+```
+
+Looking at PCA
+```{r, fig.width=10, fig.height=4}
+p1 <- plotPCA(ntop = "all", 
+        xPC = 1, 
+        yPC = 2,
+        color="condition",
+        anno_colour = col_condition,
+       shape = "input",
+        point_size = 3,
+        add_density = F,
+        add_silhouette = F,
+        #label = "ID",
+        title ="All genes")
+
+p2 <- plotPCA(ntop = "all", 
+        xPC = 1, 
+        yPC = 2,
+        color = "set",
+        anno_colour = col_set,
+        shape = "input",
+        point_size = 3,
+        add_density = F,
+        add_silhouette = F,
+        label = "ID",
+        title ="All genes")
+
+
+plot_grid(plotlist = list(p1,p2),align = "v", ncol=2)
+
+```
+
+Remove batch effect with limma
+```{r, fig.height= 8, fig.width=12}
+removedbatch_dds_vst <- as.data.frame(removeBatchEffect(x=as.matrix(assay(dds_vst)),
+                                      batch = sample_table[,colnames(sample_table) == "set"],
+                                      design =model.matrix(~condition, data = sample_table)))
+
+p1 <- plotPCA(pca_input = removedbatch_dds_vst,
+        ntop="all",
+        xPC=1,
+        yPC=2,
+        color="condition",
+        anno_colour = col_condition,
+        shape="set",
+        add_density = F,
+        add_silhouette = F,
+        point_size=3,
+        label = "ID",
+        title="PCA of batch-corrected counts")
+
+p2 <- plotPCA(pca_input = removedbatch_dds_vst,
+        ntop="all",
+        xPC=1,
+        yPC=3,
+        color="set",
+        anno_colour = col_set,
+        shape="input",
+        add_density = F,
+        add_silhouette = F,
+        point_size=3,
+        #label = "ID",
+        title="PCA of batch-corrected counts")
+
+p3 <-  plotPCA(pca_input = dds_vst,
+        ntop="all",
+        xPC=1,
+        yPC=2,
+        color="set",
+        anno_colour = col_set,
+        shape="input",
+        add_density = F,
+        add_silhouette = F,
+        point_size=3,
+        #label = "ID",
+        title="PCA of original counts")
+
+p4 <- plotPCA(pca_input= dds_vst,
+              ntop = "all", 
+        xPC = 1, 
+        yPC = 3,
+        color="condition",
+        anno_colour = col_condition,
+       shape = "set",
+        point_size = 3,
+        add_density = F,
+        add_silhouette = F,
+        label = "ID",
+        title ="PCA of original data")
+
+cowplot::plot_grid(plotlist = list(p1,p2,p3,p4),align = "v", ncol=2)
+
+
+```
+
+# 5 Overview of data
+
+## Supplemental Figure S9
+### B PCA analysis of batch-corrected bulk RNAseq data
+```{r}
+p1 <- plotPCA(pca_input = removedbatch_dds_vst,
+        ntop="all",
+        xPC=1,
+        yPC=2,
+        color="condition",
+        anno_colour = col_condition,
+        shape="set",
+        add_density = F,
+        add_silhouette = F,
+        point_size=3,
+        label = "ID")
+
+p2 <- plotPCA(pca_input = removedbatch_dds_vst,
+        ntop="all",
+        xPC=1,
+        yPC=3,
+        color="condition",
+        anno_colour = col_condition,
+        shape="set",
+        add_density = F,
+        add_silhouette = F,
+        point_size=3,
+        label = "ID")
+
+cowplot::plot_grid(plotlist = list(p1,p2),align = "v", ncol=2)
+```
+
+### C Adjusted R2 values from linear regression
+```{r}
+meta_variables = c("condition", "set", "cond_set", "uniquely_mapped_percent")
+plot_pc_regression(input = removedbatch_dds_vst,
+                               meta = sample_table,
+                               ntop = "all",
+                               meta_variables, 
+                               nPCs = 5,
+                               title = "PC contribution")
+
+```
+
+Batch correction of gene counts
+```{r batch-corrected matrix}
+genes <- genes[genes$external_gene_name %in% row.names(removedbatch_dds_vst),]
+genes$GENEID <- genes$external_gene_name
+               
+ # vst anno log
+  bc_anno_log <- as.data.frame(removedbatch_dds_vst)
+  bc_anno_log$GENEID <- row.names(bc_anno_log)
+  bc_anno_log <-merge(x=bc_anno_log, y=genes,by.x= "GENEID", by.y="external_gene_name" )
+  rownames(bc_anno_log) <- bc_anno_log$GENEID
+  
+  # vst anno (unlog)
+  bc_anno <- as.data.frame(removedbatch_dds_vst)
+  bc_anno <- 2^bc_anno
+  bc_anno$GENEID <- row.names(bc_anno)
+  bc_anno <-merge(x=bc_anno, y=genes,by= "GENEID" )
+  rownames(bc_anno) <- bc_anno$GENEID
+  
+  removed_batch <- list("log" = bc_anno_log,
+                  "unlog" = bc_anno)
+
+removed_batch_anno_log <- removed_batch$log
+removed_batch_anno <- removed_batch$unlog
+
+head(removed_batch_anno_log)
+head(removed_batch_anno)
+```
+
+### D Batch-corrected gene expression of _MAPT_ across the conditions
+```{r}
+plotSingleGene(data=removed_batch_anno, symbol= "Mapt")
+```
+
+
+# 6 DE Analysis
+```{r}
+
+comparison_table <- data.frame(comparison = c( "OE", "KD", "OE"),
+                                control = c( "Base", "Base", "KD"))
+
+comparison <- paste0(comparison_table$comparison, "_vs_",  comparison_table$control)
+
+```
+
+
+```{r}
+dds_dea <- dds
+
+# DE calculation
+DEresults_list <- list()
+  
+for (i in unique(comparison_table$control)) {
+  print(i)
+  dds_dea$condition <- relevel(dds_dea$condition, i)
+  dds_dea <- nbinomWaldTest(object = dds_dea)
+  comparison_table_subset  <-  comparison_table[comparison_table$control == i, ]
+  
+  DEresults <- DEAnalysis(input = dds_dea,
+                          comparison_table = comparison_table_subset,
+                          condition = "condition",
+                          alpha = 0.05 ,
+                          lfcThreshold = 0,
+                          sigFC = 2,
+                          multiple_testing = "IHW",
+                          pAdjustMethod = "BH",
+                          shrinkage = TRUE,
+                          shrinkType = "apeglm",
+                          gene_col = c("GENEID","ensembl_gene_id", "chromosome_name", "gene_biotype", "rep_class" ,"rep_familly","rep_name", "start_position", "end_position" ))
+  DEresults_list <- c(DEresults_list, DEresults)
+}
+
+DEresults <- DEresults_list[unique(names(DEresults_list))]
+
+
+```
+
+## Figure 6
+### B Number of DEGs
+```{r, fig.height=4, fig.width=6}
+DEcounts <- NULL
+
+for(i in 1:nrow(comparison_table)){
+  tmp <- unlist(DEresults[[1+i]]@Number_DE_genes)
+  DEcounts <- rbind(DEcounts, tmp)
+}
+
+rownames(DEcounts) <- names(DEresults)[-1]
+
+
+
+DEcounts_melt <- reshape2::melt(DEcounts)
+
+
+
+plot_DE2 <- ggplot(DEcounts_melt, aes(x = Var1, fill = Var2)) +
+  geom_col(aes(y = value), position = "dodge", color = "black") +
+  geom_text(aes(label = value, y = value), position = position_dodge(.9), hjust=1) + 
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = .5)) +
+  scale_fill_manual(values = c("up_regulated_Genes" = "#FFB9B9", "down_regulated_Genes" = "#B7D9F9")) + 
+  guides(fill = guide_legend(title = "Mode of regulation")) +
+  xlab("Comparison") + ylab("Number of DEGs") + coord_flip()
+print(plot_DE2)
+```
+
+### C Heatmap of DEGs _(differentiially expressed genes)_
+```{r, echo=TRUE, message=FALSE, results='hide', fig.height=12, fig.width=8}
+# the uDEG() function produces the union of the DE genes from the specified comparisons
+allDEgenes <- uDEG(comparisons = comparison )
+
+plotHeatmap(input = removed_batch_anno,
+            geneset = allDEgenes,
+            title = "Heatmap of DEGs",
+            keyType = "Ensembl",
+            show_rownames = F,
+            cluster_cols = T,
+            plot_mean = F)
+
+```
+
+### D Volcano pllots of DEGs in Tau o/e andTau k/d neurons
+```{r}
+p1 <- plotVolcano(DEresults_obj = DEresults, comparison = "OE_vs_Base", labelnum = 20)
+p2 <- plotVolcano(DEresults_obj = DEresults, comparison = "KD_vs_Base", labelnum = 20)
+cowplot::plot_grid(plotlist = list(p1,p2),align = "v", ncol=2)
+```
+
+
+```{r}
+GO_terms       <- read.gmt("/data/references/mouse_msigdb/m5.go.bp.v2022.1.Mm.symbols.gmt")
+HALLMARK_terms <- read.gmt("/data/references/mouse_msigdb/mh.all.v2022.1.Mm.symbols.gmt")
+
+# define universe
+universe <- unique(as.character(norm_anno$GENEID))
+```
+
+```{r}
+GSEA_results <- enrichGSEA(comparisons = comparison,
+                            DE_results = DEresults, 
+                            universe = universe,
+                            GeneSets = c("GO", "HALLMARK"),
+                            pCorrection = "bonferroni", 
+                            pvalueCutoff = 0.05,
+                            qvalueCutoff = 0.2,
+                           col_gene = "GENEID")
+```
+### E Gene set enrichment analysis for all DEGs (Hallmark)
+```{r}
+dotplotGSEA(enrich.df = GSEA_results$HALLMARK, show = 20, orderBy = "padj", colorBy = "regulation", scaleBy =  "count")
+```
+
+### I DEGs by chromosomes
+```{r}
+#Testing for enrichment of DEGs for each chromosome
+enrichment_results <- list()
+for(i in comparison){
+results_df <- DEresults[[i]]@results
+
+
+# Calculate total number of DE and non-DE genes
+total_genes <- nrow(results_df)
+total_DE_genes <- sum(results_df$regulation!="n.s.")
+results_df$is_DE <- results_df$regulation != "n.s."
+
+# Loop through each chromosome and calculate enrichment
+enrichment_results_1 <- results_df %>%
+  group_by(chromosome_name) %>%
+  summarize(
+    num_genes = n(),
+    num_DE_genes = sum(is_DE)
+  ) %>%
+  mutate(
+    p_value = phyper(q=num_DE_genes, m = num_genes, n= total_genes-num_genes, total_DE_genes, lower.tail = FALSE)
+  ) %>%
+  arrange(p_value)
+
+enrichment_results_1 <-enrichment_results_1[enrichment_results_1$num_DE_genes > 1,]
+enrichment_results_1$comp <- i
+# Adjust for multiple testing
+enrichment_results[[i]] <- enrichment_results_1 %>%
+  mutate(adj_p_value = p.adjust(p_value, method = "BH"))
+}
+
+chrom_enrichment <- do.call( rbind,enrichment_results)
+chrom_enrichment
+
+#DEGs for each chromosome
+DEGs_chrom( i= "OE_vs_Base")
+
+```
+
+
+### K Association of DEGs with chromosome and LADs (Tau o/e vs. Tau base)
+
+```{r}
+T1_LAD <- read.table("/data/analysis/pia/TE_analysis/T1_GSM5669198_D5Midbrain_LADs_mm39.bed", header=FALSE, sep ="\t")[,1:4]
+T2_LAD <- read.table("/data/analysis/pia/TE_analysis/T2_GSM5669198_D5Midbrain_LADs_mm39.bed", header=FALSE, sep ="\t")[,1:4]
+colnames(T1_LAD) <- c("chromosome_name", "start", "end", "name")
+colnames(T2_LAD) <- c("chromosome_name", "start", "end", "name")
+T1_LAD$LAD_Type <- "T1"
+T2_LAD$LAD_Type<- "T2"
+df_LAD <- rbind(T1_LAD, T2_LAD)
+df_LAD$chromosome_name <- factor(str_split_fixed(df_LAD$chromosome_name, "r", n=2)[,2], levels = c("1","2","3","4","5","6","7","8","9",
+                                                          "10","11","12","13","14","15","16",
+                                                          "17","18","19", "X", "Y", "MT"))
+```
+
+```{r, fig.height=12, fig.width= 20}
+
+list_degenes_overlap <- list()
+list_plt1 <- list()
+list_plt2 <- list()
+list_pvalues <- list()
+for(comp in comparison){
+ 
+  # Prepare DE genes for each condition as a GRanges object
+
+  de_genes <- DEresults[[comp]]@results %>%
+    mutate(is_DE = regulation != "n.s." ) %>%
+    drop_na(start_position, end_position) %>%
+    mutate(chromosome_name = as.character(chromosome_name)) %>%
+    with(., GRanges(seqnames = chromosome_name,
+                    ranges = IRanges(start = start_position, end = end_position,is_DE = is_DE, gene=GENEID, log2FoldChange=log2FoldChange, chrom = chromosome_name)))
+
+  # Prepare LAD regions as a GRanges object
+  LAD_granges <- with(df_LAD, GRanges(seqnames = chromosome_name,
+                                      ranges = IRanges(start = start, end = end),
+                                      LAD_Type = LAD_Type))
+  
+  LAD_granges_T1 <- LAD_granges[LAD_granges$LAD_Type =="T1",]
+  LAD_granges_T2 <- LAD_granges[LAD_granges$LAD_Type =="T2",]
+
+  # Find overlaps with LADs 
+  overlaps_T1 <- findOverlaps(de_genes, LAD_granges_T1)
+  overlaps_T2 <- findOverlaps(de_genes, LAD_granges_T2)
+  
+  # Add overlap information
+  de_genes$overlap_T1 <- ifelse(seq_along(de_genes) %in% queryHits(overlaps_T1), TRUE, FALSE)
+  de_genes$overlap_T2 <- ifelse(seq_along(de_genes) %in% queryHits(overlaps_T2), TRUE, FALSE)  
+  
+  
+ for (chr in unique(de_genes$chrom)) {
+
+  # Subset DE genes by chromosome
+  de_genes_chr <- de_genes[de_genes$chrom == chr, ]
+  
+  
+  # Check if there are DE genes overlapping with LAD Type1
+  if (sum(de_genes_chr$overlap_T1, na.rm = TRUE) == 0) {
+ #   print(paste0(comp, " on chromosome ", chr, " showed no overlap with LAD Type1"))
+  } else {
+    
+    # Count overlapping and non-overlapping DE genes for LAD Type1
+    overlap_counts_T1 <- de_genes_chr %>%
+      as.data.frame() %>%
+      group_by(overlap_T1, is_DE) %>%
+      tally() %>%
+      spread(overlap_T1, n, fill = 0) %>%
+      rename(non_overlap = `FALSE`, overlap = `TRUE`)
+
+    # Get the counts for the hypergeometric test
+    total_DE_genes <- sum(de_genes_chr$is_DE)  # Total DE genes on the chromosome
+    total_genes <- length(de_genes_chr$gene)# Total number of genes on the chromosome
+    overlap_DEgenes <- overlap_counts_T1$overlap[2]  # DE genes that overlap with LAD
+    overlap_totalgenes <- overlap_counts_T1$overlap[1]  # DE genes that do not overlap with LAD
+    
+    if(total_DE_genes >= 2){    
+    # Apply hypergeometric test (phyper: p-value for the cumulative distribution)
+    p_value_T1 <- phyper(q = overlap_DEgenes, m = overlap_totalgenes, n=total_genes-overlap_totalgenes, k=total_DE_genes, lower.tail = FALSE)
+    
+    
+ #   print(paste0(comp, " on chromosome ", chr, " had the following p-value ", p_value_T1, " for LAD Type1"))
+    list_pvalues[[paste(comp, chr, "T1", sep="_")]] <- data.frame(comparison =comp, 
+                                                                  chromosome = chr,
+                                                                  LAD = "T1", 
+                                                                  p.value = p_value_T1,
+                                                                  overlap_DEgenes = overlap_DEgenes,
+                                                                  chr_DEgenes = total_DE_genes)
+    }
+  }
+  
+  
+  
+  # Check if there are DE genes overlapping with LAD Type2
+  if (sum(de_genes_chr$overlap_T2, na.rm = TRUE) == 0) {
+#    print(paste0(comp, " on chromosome ", chr, " showed no overlap with LAD Type2"))
+    
+  } else {
+    # Count overlapping and non-overlapping DE genes for LAD Type2
+    overlap_counts_T2 <- de_genes_chr %>%
+      as.data.frame()%>%
+      group_by(overlap_T2, is_DE) %>%
+      tally() %>%
+      spread(overlap_T2, n, fill = 0) %>%
+      rename(non_overlap = `FALSE`, overlap = `TRUE`)
+    
+     # Get the counts for the hypergeometric test
+    total_DE_genes <- sum(de_genes_chr$is_DE)  # Total DE genes on the chromosome
+    total_genes <- length(de_genes_chr$gene)# Total number of genes on the chromosome
+    overlap_DEgenes <- overlap_counts_T2$overlap[2]  # DE genes that overlap with LAD
+    overlap_totalgenes <- overlap_counts_T2$overlap[1]  # DE genes that do not overlap with LAD
+    
+    if(total_DE_genes >= 2){
+    # Apply hypergeometric test (phyper: p-value for the cumulative distribution)
+    p_value_T2 <- phyper(q = overlap_DEgenes, m = overlap_totalgenes, n=total_genes-overlap_totalgenes, k=total_DE_genes, lower.tail = FALSE)
+    
+    
+ #   print(paste0(comp, " on chromosome ", chr, " had the following p-value ", p_value_T2, " for LAD Type2"))
+    list_pvalues[[paste(comp, chr, "T2", sep="_")]] <- data.frame(comparison =comp, 
+                                                                  chromosome = chr, 
+                                                                  LAD = "T2", 
+                                                                  p.value = p_value_T2,
+                                                                  overlap_DEgenes = overlap_DEgenes,
+                                                                  chr_DEgenes = total_DE_genes)
+    }
+  }
+ }
+
+
+de_genes  <- as.data.frame(de_genes)
+  
+LAD_scale <- df_LAD %>%
+  
+  # Compute chromosome size
+  group_by(chromosome_name) %>% 
+  summarise(chr_len=max(end)) %>% 
+  arrange(as.numeric(chromosome_name)) %>%
+  
+  # Calculate cumulative position of each chromosome
+  mutate(tot=cumsum(as.numeric(chr_len))-chr_len)
+
+scale <- DEresults[[comp]]@results %>% 
+  
+  # Compute chromosome size
+  group_by(chromosome_name) %>% 
+  summarise(chr_len=max(start_position)) %>% 
+  arrange(as.numeric(chromosome_name)) %>%
+  
+  # Calculate cumulative position of each chromosome
+  mutate(tot=cumsum(as.numeric(chr_len))-chr_len)
+
+LAD_scale <- rbind(LAD_scale, scale[!scale$chromosome_name %in% LAD_scale$chromosome_name,]) 
+
+
+
+LAD <- df_LAD %>%
+  # Add this info to the initial dataset
+  left_join(LAD_scale, ., by=c("chromosome_name"="chromosome_name")) %>%
+    # Add a cumulative position for each LAD
+  arrange(chromosome_name, start) %>%
+  mutate( startcum=start+tot) %>% 
+  mutate( endcum=end+tot) 
+LAD$y1 <- gsub("T1", -0.5, LAD$LAD_Type)
+LAD$y1 <- gsub("T2", 0, LAD$y1)
+LAD$y2 <- gsub("T1", 0, LAD$LAD_Type)
+LAD$y2 <- gsub("T2", 0.5, LAD$y2)
+
+de_genes$seqnames <- factor(de_genes$seqnames, levels =c("1","2","3","4","5","6","7","8","9",
+                                                          "10","11","12","13","14","15","16",
+                                                          "17","18","19", "X", "Y", "MT") )
+de_genes$chromosome_name <- de_genes$seqnames
+LAD$chromosome_name <- factor(LAD$chromosome_name, levels =c("1","2","3","4","5","6","7","8","9",
+                                                          "10","11","12","13","14","15","16",
+                                                          "17","18","19", "X", "Y", "MT") )
+LAD <- LAD[!is.na(LAD$chromosome_name),]
+de_genes <- de_genes[!is.na(de_genes$chromosome_name),]
+de_genes <- de_genes[de_genes$is_DE,]
+
+
+LAD_scale <- LAD_scale[!is.na(LAD_scale$tot),]
+panel_scale <- LAD_scale$chr_len/ max(LAD_scale$chr_len)
+axisdf = LAD %>%
+  group_by(chromosome_name) %>%
+  summarize()
+print(comp)
+#print(table(de_genes$overlap_T1))
+#print(table(de_genes$overlap_T2))
+
+#LAD Type2
+list_plt2[[comp]] <- ggplot() +
+
+  geom_rect(data=LAD, mapping=aes(xmin=start, xmax=end, ymin=as.numeric(y1), ymax=as.numeric(y2), fill=LAD_Type), alpha=0.5) +
+       scale_fill_manual(values = c("#00712D", "#87A922") ) +
+  
+    geom_point(de_genes, mapping= aes(x=start, y=log2FoldChange, color=overlap_T2), alpha=0.8, size=0.8) +
+   scale_color_manual(values = c( "darkblue","firebrick")) +
+    
+    # custom X axis:
+ #    scale_x_continuous( label = axisdf$chromosome_name, breaks= axisdf$center ) +
+   # scale_y_continuous( ) +     # remove space between plot area and x axis
+   
+  facet_wrap(~chromosome_name, ncol=22, scales= "free_x")+
+  #   # Custom the theme:
+    theme_bw() +
+    theme(
+      axis.title.x = element_blank(),
+      axis.text.x = element_blank(),
+      axis.ticks.x  = element_blank(),
+      panel.border = element_blank(),
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor.x = element_blank()
+    ) +
+  labs(title= comp)+
+  force_panelsizes(cols = 3*panel_scale, rows = c(6), respect = TRUE)
+#LAD Type 1
+list_plt1[[comp]] <- ggplot() +
+
+  geom_rect(data=LAD, mapping=aes(xmin=start, xmax=end, ymin=as.numeric(y1), ymax=as.numeric(y2), fill=LAD_Type), alpha=0.5) +
+       scale_fill_manual(values = c("#00712D", "#87A922") ) +
+  
+    geom_point(de_genes, mapping= aes(x=start, y=log2FoldChange, color=overlap_T1), alpha=0.8, size=0.8) +
+   scale_color_manual(values = c( "darkblue","firebrick")) +
+    
+    # custom X axis:
+ #    scale_x_continuous( label = axisdf$chromosome_name, breaks= axisdf$center ) +
+   # scale_y_continuous( ) +     # remove space between plot area and x axis
+   
+  facet_wrap(~chromosome_name, ncol=22, scales= "free_x")+
+  #   # Custom the theme:
+    theme_bw() +
+    theme(
+      axis.title.x = element_blank(),
+      axis.text.x = element_blank(),
+      axis.ticks.x  = element_blank(),
+      panel.border = element_blank(),
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor.x = element_blank()
+    ) +
+  labs(title= comp)+
+  force_panelsizes(cols = 3*panel_scale, rows = c(6), respect = TRUE)
+
+list_degenes_overlap[[comp]] <- de_genes
+}
+
+#Results of hypergeometric p test if DEGs significantly overlap with LADs per chromosome
+df_statistic <- do.call("rbind", list_pvalues)
+df_statistic$p.adjusted <- p.adjust(df_statistic$p.value, method= "BH")
+df_statistic[df_statistic$p.adjusted <= 0.05,]
+```
+
+```{r}
+cowplot::plot_grid(plotlist = list(list_plt1[["OE_vs_Base"]],list_plt2[["OE_vs_Base"]]) ,align = "v", ncol=1)
+```
+
+### L Chromosome enrichment of LAD type2 DEGs
+```{r}
+OE_vs_Base_overlap <- list_degenes_overlap$OE_vs_Base[list_degenes_overlap$OE_vs_Base$overlap_T1 | list_degenes_overlap$OE_vs_Base$overlap_T2,] %>%
+  arrange(overlap_T1, chrom, .by_group = TRUE)
+
+OE_vs_KD_overlap <- list_degenes_overlap$OE_vs_KD[list_degenes_overlap$OE_vs_KD$overlap_T1 | list_degenes_overlap$OE_vs_KD$overlap_T2,]%>%
+  arrange(overlap_T1, chrom, .by_group = TRUE)
+
+KD_vs_Base_overlap <- list_degenes_overlap$KD_vs_Base[list_degenes_overlap$KD_vs_Base$overlap_T1 | list_degenes_overlap$KD_vs_Base$overlap_T1,]%>%
+  arrange(overlap_T1, chrom, .by_group = TRUE)
+
+
+OE_vs_Base_overlap$comparison <- "OE_vs_Base"
+OE_vs_KD_overlap$comparison <- "OE_vs_KD"
+
+overlap_T2_chrom <- rbind(OE_vs_Base_overlap, OE_vs_KD_overlap)
+overlap_T2_chrom <- overlap_T2_chrom[,c("chrom", "overlap_T2", "gene", "comparison", "log2FoldChange")]
+overlap_T2_chrom_wide <- reshape(overlap_T2_chrom,idvar=c("gene", "chrom"), timevar = "comparison", direction="wide" )
+overlap_T2_chrom_wide[overlap_T2_chrom_wide$chrom %in% unique(df_statistic[df_statistic$p.adjusted <= 0.05 & df_statistic$comparison == "OE_vs_Base","chromosome"]) & overlap_T2_chrom_wide$overlap_T2.OE_vs_Base,c("chrom", "gene", "log2FoldChange.OE_vs_Base")]
+
+overlap_T2_chrom_wide[overlap_T2_chrom_wide$chrom %in% unique(df_statistic[df_statistic$p.adjusted <= 0.05 & df_statistic$comparison == "OE_vs_KD","chromosome"]) & overlap_T2_chrom_wide$overlap_T2.OE_vs_KD,c("chrom", "gene", "log2FoldChange.OE_vs_KD")]
+
+```
+## Supplemental Figure S10
+
+### A Number of DEGs by classes
+```{r, fig.height=4, fig.width=10}
+DEcounts <- NULL
+
+for(i in comparison){
+  down <- as.data.frame(table(DEresults[[i]]@DE_genes$down_regulated_Genes$gene_biotype))
+  up <- as.data.frame(table(DEresults[[i]]@DE_genes$up_regulated_Genes$gene_biotype))
+  colnames(down) <- c("Type", "Genes")
+  colnames(up) <- c("Type", "Genes")
+  up$regulation <- "up"
+  down$regulation <- "down"
+  DEgenes <- rbind(down, up)
+  DEgenes$comparison <- i
+  DEcounts <- rbind(DEgenes, DEcounts)
+}
+
+DEcounts <- DEcounts[grep("ENS", DEcounts$Type, invert=TRUE),]
+
+plot_DE3 <- ggplot(DEcounts, aes(x = Type, fill = regulation)) +
+  geom_col(aes(y = Genes), position=position_dodge2(preserve="single"), color = "black") +
+  geom_text(aes(label = Genes, y = Genes), position = position_dodge(.9), hjust=1) + 
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = .5)) +
+  scale_fill_manual(values = c("up" = "#FFB9B9", "down" = "#B7D9F9")) + 
+  facet_wrap(~DEcounts$comparison, ncol=6)+
+  guides(fill = guide_legend(title = "Mode of regulation")) +
+  xlab("Gene type") + ylab("Number of DEGs") + coord_flip()
+print(plot_DE3)
+```
+### B GO Biological process/ all DEGs
+```{r, fig.height=9, fig.width=10}
+dotplotGSEA(enrich.df = GSEA_results$GO, show = 20, orderBy = "padj", colorBy = "regulation", scaleBy =  "count")
+```
+
+### D Non-protein coding DEGs by condition and classes
+```{r}
+#Non-protein coding DEGs
+DEG <- list()
+for(i in comparison){
+  down <- DEresults[[i]]@DE_genes$down_regulated_Genes
+  up <- DEresults[[i]]@DE_genes$up_regulated_Genes
+  up$regulation <- "up"
+  down$regulation <- "down"
+  down <- down[down$gene_biotype != "protein_coding",c("GENEID", "gene_biotype", "regulation")]
+  down <- down[order(down$gene_biotype),]
+  up <- up[up$gene_biotype != "protein_coding",c("GENEID", "gene_biotype", "regulation")]
+  up <- up[order(up$gene_biotype),]
+  DEgenes <- rbind(down, up)
+  DEG[[i]] <- DEgenes
+}
+DEG
+```
+
+## Supplemental Figure S12
+
+### A DEGs by chromosomes
+```{r}
+DEGs_chrom(i= "OE_vs_KD")
+```
+
+### B LAD type1/ DEG overlap
+```{r}
+cowplot::plot_grid(plotlist = list(list_plt1[["OE_vs_KD"]],list_plt1[["KD_vs_Base"]]) ,align = "v", ncol=1)
+```
+### C LAD type2/ DEG overlap
+```{r}
+cowplot::plot_grid(plotlist = list(list_plt1[["OE_vs_KD"]],list_plt1[["KD_vs_Base"]]) ,align = "v", ncol=1)
+```
+
+
