@@ -16,4 +16,3 @@ The following bulk RNA-seq analysis have been performed in the docker container 
 
 ## H3K9ac Cut&Tag
 
-The fastq-files, as well as, the metadata of the H3K9ac Cut&Tag data can be find here.
