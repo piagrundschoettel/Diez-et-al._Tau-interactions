@@ -1,0 +1,4 @@
+"wPGSA_IDs","Gene_Symbol_Mus","p_value_mean","t_score_mean","FDR_p_val","ensembl_gene_id","chromosome_name","gene_biotype","rep_class","rep_familly","rep_name","start_position","end_position","comparison","regulation","baseMean","log2FoldChange","lfcSE","pvalue","padj"
+"CREM","Crem",1.21e-19,-6.523970132,1.55e-18,"ENSMUSG00000063889","18","protein_coding",NA,NA,NA,3266048,3337748,"OE vs Base","up",93.25189868,1.11066829,0.167622562,2.94e-12,6.44e-10
+"REST","Rest",1.12e-17,-6.270602199,8.97e-17,"ENSMUSG00000029249","5","protein_coding",NA,NA,NA,77413338,77434279,"OE vs Base","up",37.43628674,1.022649757,0.168946899,1e-10,1.92e-08
+"TGIF1","Tgif1",2.96e-19,-6.071427551,3.4e-18,"ENSMUSG00000047407","17","protein_coding",NA,NA,NA,71151200,71160541,"OE vs Base","up",15.37316338,1.018888765,0.346310209,0.000176675,0.005899717
